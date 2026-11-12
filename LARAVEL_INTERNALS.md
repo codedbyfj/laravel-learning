@@ -1,5 +1,7 @@
 # The Definitive Guide to Laravel Framework Internals
 
+> **Architecture Target**: Modern Laravel architecture (11+). Where core internal patterns evolved from earlier framework iterations, historical context is explicitly provided.
+> 
 > **Goal**: Demystify Laravel's "magic". By the end of this guide, you will understand how Laravel works line-by-line under the hood, how all its internal components talk to each other, and how to read the framework's source code with confidence.
 
 ---
@@ -10,7 +12,7 @@
 2. [The Request Lifecycle: The Complete Journey](#2-the-request-lifecycle-the-complete-journey)
    - [2.1 The Entry Point: `public/index.php`](#21-the-entry-point-publicindexphp)
    - [2.2 Modern Application Bootstrapping (`bootstrap/app.php`)](#22-modern-application-bootstrapping-bootstrapappphp)
-   - [2.3 The Bootstrapping Sequence (Kernels & Bootstrappers)](#23-the-bootstrapping-sequence-kernels--bootstrappers)
+   - [2.3 The Bootstrapping Sequence (`Application::bootstrapWith`)](#23-the-bootstrapping-sequence-applicationbootstrapwith)
    - [2.4 Response Delivery & The Termination Phase](#24-response-delivery--the-termination-phase)
 3. [The Heart: The Service Container (`Illuminate\Container\Container`)](#3-the-heart-the-service-container-illuminatecontainercontainer)
    - [3.1 Internal Data Structures](#31-internal-data-structures)
@@ -27,7 +29,7 @@
    - [5.3 Controller Dispatching & Parameter Injection](#53-controller-dispatching--parameter-injection)
 6. [Facades Decoded: How Static Calls Become Real Objects](#6-facades-decoded-how-static-calls-become-real-objects)
    - [6.1 The Mechanics: `__callStatic()` and the Container](#61-the-mechanics-__callstatic-and-the-container)
-   - [6.2 Real-Time Facades](#62-real-time-facades)
+   - [6.2 Real-Time Facades (In-Memory `eval()` Generation)](#62-real-time-facades-in-memory-eval-generation)
    - [6.3 How Facades Support Mocking](#63-how-facades-support-mocking)
 7. [Database & Eloquent ORM Internals](#7-database--eloquent-orm-internals)
    - [7.1 The Four-Tier Architecture: Model, Eloquent Builder, Query Builder, PDO](#71-the-four-tier-architecture-model-eloquent-builder-query-builder-pdo)
@@ -78,7 +80,7 @@ flowchart TD
     B --> C["public/index.php"]
     C --> D["vendor/autoload.php (Composer Autoloader)"]
     D --> E["bootstrap/app.php (Application Instance Built)"]
-    E --> F["Kernel Bootstrappers (Env, Config, Providers, Facades)"]
+    E --> F["Bootstrappers (Env, Config, Providers, Facades)"]
     F --> G["Global Middleware Pipeline"]
     G --> H["Routing & Route-Matched Middleware"]
     H --> I["Controller Action / Route Closure"]
@@ -147,7 +149,7 @@ return Application::configure(basePath: dirname(__DIR__))
     })->create();
 ```
 
-> **Historical Context**: Legacy Laravel applications placed this configuration across multiple boilerplate files (`app/Http/Kernel.php`, `app/Console/Kernel.php`, and multiple service providers like `RouteServiceProvider`). The modern fluent builder accomplishes the exact same internal registration, but centralizes it cleanly in one place.
+> **Historical Context**: In earlier Laravel versions, this setup was split across multiple files: `app/Http/Kernel.php`, `app/Console/Kernel.php`, and dedicated providers like `RouteServiceProvider`. Modern Laravel consolidates this registration into `ApplicationBuilder`, which delegates to the exact same underlying framework mechanisms.
 
 #### Under the Hood: `Application::configure()`
 Under the hood, `Application::configure()` creates an instance of `Illuminate\Foundation\Configuration\ApplicationBuilder`.
@@ -155,14 +157,14 @@ When you call `->create()`, the builder:
 1. Instantiates `Illuminate\Foundation\Application` (which is the Service Container itself).
 2. Sets the base application paths (`app`, `config`, `storage`, `public`, `database`).
 3. Registers core framework Service Providers (Event, Log, Routing).
-4. Configures routing paths, middleware stacks, and exception handling.
+4. Prepares routing paths, middleware stacks, and exception handling definitions.
 
 ---
 
-### 2.3 The Bootstrapping Sequence (Kernels & Bootstrappers)
+### 2.3 The Bootstrapping Sequence (`Application::bootstrapWith`)
 
-Before your route is matched or your controller runs, Laravel must execute a series of **Bootstrappers**.
-In `Illuminate\Foundation\Http\Kernel`, you find the `$bootstrappers` array:
+Before any route can be matched or controller executed, the application instance runs its core **Bootstrappers**.
+In modern Laravel, `ApplicationBuilder` passes the core bootstrapper list to `Application::bootstrapWith($bootstrappers)`:
 
 ```php
 protected $bootstrappers = [
@@ -175,7 +177,7 @@ protected $bootstrappers = [
 ];
 ```
 
-Let's see what each bootstrapper does internally:
+Let's trace what each bootstrapper does internally:
 
 1. **`LoadEnvironmentVariables`**: Uses `vlucas/phpdotenv` to parse the `.env` file into PHP's `$_ENV` and `getenv()`.
 2. **`LoadConfiguration`**: Scans all files in `config/*.php`. It parses them into a single in-memory `Illuminate\Config\Repository` repository object. If `bootstrap/cache/config.php` exists (from `php artisan config:cache`), it loads that single compiled array instantly, bypassing the filesystem scan.
@@ -186,7 +188,7 @@ Let's see what each bootstrapper does internally:
 
 > **Crucial Rule**:
 > - In `register()`: **Only bind services into the container**. Never invoke or depend on other services, because they might not have registered yet.
-> - In `boot()`: All services are registered. It is now safe to resolve dependencies, register route macros, event listeners, or model observers.
+> - In `boot()`: All services are registered. It is now safe to resolve dependencies, register route macros, model observers, or event listeners.
 
 ---
 
@@ -630,19 +632,32 @@ sequenceDiagram
 
 ---
 
-### 6.2 Real-Time Facades
+### 6.2 Real-Time Facades (In-Memory `eval()` Generation)
 
-Laravel allows you to turn any application class into a Facade instantly by prefixing the namespace with `Facades\`:
+Laravel allows turning any application class into a Facade on demand by prefixing the namespace with `Facades\`:
 ```php
 use Facades\App\Services\PaymentService;
 
 PaymentService::charge(100);
 ```
 
-How does this work without generating files beforehand?
-1. Laravel registers an SPL class autoloader (`spl_autoload_register`).
-2. When PHP encounters a class starting with `Facades\`, Laravel intercepts it.
-3. If the file does not exist, Laravel dynamically creates a PHP file in `storage/framework/cache/` that extends `Illuminate\Support\Facades\Facade` and sets `getFacadeAccessor()` to the target class, then loads it with `require`.
+How does this work under the hood without pre-generated files?
+1. Laravel registers `Illuminate\Foundation\AliasLoader` inside PHP's SPL class autoloader stack (`spl_autoload_register`).
+2. When PHP encounters an unresolved class starting with `Facades\`, `AliasLoader::load()` intercepts the request.
+3. It parses the target class name (`App\Services\PaymentService`).
+4. In memory, it constructs the class definition string:
+   ```php
+   namespace Facades\App\Services;
+
+   class PaymentService extends \Illuminate\Support\Facades\Facade
+   {
+       protected static function getFacadeAccessor()
+       {
+           return 'App\\Services\\PaymentService';
+       }
+   }
+   ```
+5. It executes `eval()` on that definition string. The class is registered directly into PHP's runtime memory without reading or writing any files to disk.
 
 ---
 
@@ -911,20 +926,20 @@ Because the worker is a continuous running PHP process, **the application code s
 
 ### 9.1 Stateless PHP-FPM vs Persistent Memory Runtimes
 
-Understanding the runtime environment is essential to understanding Laravel internals:
+Understanding runtime memory architecture is essential for senior developers:
 
-| Feature | Traditional PHP-FPM | Modern Long-Running (Laravel Octane) |
+| Dimension | Traditional PHP-FPM | Long-Running Runtimes (Laravel Octane) |
 | :--- | :--- | :--- |
-| **Lifecycle** | "Shared Nothing" – Script boots and dies per request | Single boot – Process stays alive in memory across thousands of requests |
-| **Boot Cost** | Bootstrapping runs on **every request** (~20-50ms) | Bootstrapping runs **once** at server startup (~0ms per request) |
-| **Performance** | Standard (50-200 requests/sec per server) | Ultra High (2,000-10,000+ requests/sec) |
-| **State Leaks** | Impossible (memory completely wiped after each request) | **High Risk** (global variables and static singletons persist across users) |
+| **Execution Model** | "Shared Nothing" – Script boots from scratch and completely exits per request | Single Boot – Master PHP process boots once and stays alive in RAM |
+| **Bootstrap Overhead** | Incurred on **every incoming HTTP request** (loading config, routes, providers) | Incurred **once at server startup**; zero bootstrap cost for subsequent requests |
+| **Request Handling** | Cold-to-warm request lifecycle | Warm in-memory execution loop (FrankenPHP, Swoole, RoadRunner) |
+| **State & Memory Risk** | Zero risk of inter-request state leaks (memory is wiped cleanly on exit) | **High risk of state bleeding** (static properties and singletons persist across users) |
 
 ---
 
 ### 9.2 The Container Sandbox & State Resets
 
-In long-running environments like Laravel Octane (running on FrankenPHP, Swoole, or RoadRunner), the base Application instance is booted once at server launch.
+In long-running environments like Laravel Octane, the base Application instance is booted once at server launch.
 
 To prevent User A's data from leaking to User B:
 1. The server creates a **Sandbox Application** (a clone of the container) for each incoming request.
@@ -948,7 +963,7 @@ To prevent User A's data from leaking to User B:
 
 1. **`index.php` is the single door**: Every web request enters through `public/index.php` and exits via `$response->send()`.
 2. **`$app` is the Container**: The Application instance is simply a specialized Service Container with knowledge of paths and environments.
-3. **Two-phase Service Providers**: Bind into the container during `register()`; coordinate and interact during `boot()`.
+3. **Two-phase Service Providers**: Bind into the container during `register()`; resolve dependencies, register macros, observers, routes, and event listeners during `boot()`.
 4. **Auto-wiring via Reflection**: Zero-config dependency injection works by reflecting on constructor parameter type-hints.
 5. **Pipelines are `array_reduce`**: Middleware is not magical; it's an array of closures reduced into an onion-like stack.
 6. **Facades are proxy pointers**: Facades are static gateways that use `__callStatic()` to resolve and call real instances from the container.
